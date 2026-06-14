@@ -1,0 +1,459 @@
+// ============================================================
+// LPBF BEAM SHAPING STUDY - 6 BEAM PROFILES + AMR
+// FreeFEM++  |  Based on Sinha & Mukherjee (2025)
+// Manufacturing Letters 45, 53-59
+//
+// PHYSICS: 3D transient heat transfer (pure thermal, no flow)
+//   rho*Cp(T)*dT/dt = div(k(T)*grad T) + Q_beam(x,y,z,t)
+//   Moving laser source along x-axis at speed v_scan
+//
+// 6 BEAM PROFILES (Eqs. 1-6 from paper):
+//   1. Gaussian     : Ig  = 2P/(pi*Rg^2) * exp(-2r^2/Rg^2)
+//   2. Ellip-Gauss  : Ieg = 2P/(pi*a1*b1) * exp(-2((x/a1)^2+(y/b1)^2))
+//   3. Top Hat      : ITH = P/(pi*Rg^2)          inside r < Rg
+//   4. Flat Top     : IFT = g*P/a2^2             inside square |x|,|y| < a2/2
+//   5. Ring shaped  : Id  = P/(pi*Rm^2) * (r^2/Rm^2)*exp(-r^2/Rm^2), Rm=(Ri+Ro)/2
+//   6. AMB          : IAMB = 20%*Ig + 80%*Id
+//
+// MATERIAL: AlSi10Mg (from paper Table 1 + Supplementary)
+//   Liquidus: 867 K, Solidus: 831 K
+//   Temperature-dependent k(T), Cp(T)
+//
+// AMR: sinh grading - fine at laser spot, coarse at boundaries
+//   Ratio ~10:1 fine:coarse near beam vs far field
+//
+// OUTPUT per beam:
+//   - VTU temperature field at half-track position
+//   - Melt pool width, depth at half-track
+//   - Peak temperature
+//   - Cooling rate dT/dt at solidification front
+//   - CSV comparison table matching paper Table 1
+// ============================================================
+
+load "iovtk"
+
+string outdir = "D:\\freefem++\\lpbf_beams\\";
+system("mkdir \"D:\\freefem++\\lpbf_beams\"");
+
+// ============================================================
+// PROCESS PARAMETERS (from paper)
+// ============================================================
+real Plaser  = 400.;        // laser power [W]
+real vscan   = 1000.e-3;    // scanning speed [m/s]  = 1000 mm/s
+real hLayer  = 30.e-6;      // powder layer thickness [m]
+real Tamb    = 298.;        // ambient/preheat temperature [K]
+
+// Track length and domain
+real Ltrack  = 5.e-3;       // track length [m]  5 mm
+real Wdomain = 1.5e-3;      // domain half-width Y [m]
+real Ddomain = 1.0e-3;      // domain depth Z [m]
+
+// ============================================================
+// BEAM PARAMETERS (from paper Table 1)
+// ============================================================
+// 1. Gaussian
+real Rg      = 100.e-6;     // Gaussian beam radius [m]
+
+// 2. Elliptical-Gaussian
+real a1ell   = 55.e-6;      // minor axis [m]
+real b1ell   = 175.e-6;     // major axis [m]
+
+// 3. Top Hat: same Rg
+
+// 4. Flat Top
+real a2ft    = 177.25e-6;   // square side [m]  (same area as top hat)
+real gammaFT= 1.;          // uniform factor (g=1 for flat top)
+
+// 5. Ring shaped
+real Ri      = 150.e-6;     // inner radius [m]
+real Ro      = 175.e-6;     // outer radius [m]
+
+// 6. AMB: 20% Gaussian + 80% Ring
+real PgAMB   = 0.2*Plaser;  // Gaussian power [W]
+real PrAMB   = 0.8*Plaser;  // Ring power [W]
+
+// ============================================================
+// MATERIAL: AlSi10Mg (temperature-dependent)
+// ============================================================
+real Tliq    = 867.;        // liquidus [K]
+real Tsol    = 831.;        // solidus [K]
+real Lfus    = 560.e3;      // latent heat [J/kg]  AlSi10Mg
+
+// Piecewise linear k(T) and Cp(T) for AlSi10Mg
+// Data from Sinha & Mukherjee supplementary + literature
+func real kAlSi(real T) {
+    if (T < 400.)  return 130.;
+    if (T < Tsol)  return 130. + (160.-130.)*(T-400.)/(Tsol-400.);
+    if (T < Tliq)  return 160.;
+    return 95.;    // liquid
+}
+func real CpAlSi(real T) {
+    if (T < Tsol)  return 900.;
+    if (T < Tliq)  return 900. + Lfus/(Tliq-Tsol);  // mushy zone
+    return 1160.;  // liquid
+}
+func real rhoAlSi(real T) {
+    if (T < Tliq) return 2670.;
+    return 2380.;  // liquid
+}
+
+// ============================================================
+// MESH (3D, graded - fine near laser path)
+// ============================================================
+// Domain: x in [0,Ltrack], y in [-Wdomain,Wdomain], z in [-Ddomain,0]
+// z=0 is the powder surface (laser hits here)
+// AMR: sinh grading in y (fine at y=0 = laser path centreline)
+//      exp grading in z  (fine at z=0 = surface)
+//      uniform in x      (laser traverses full length)
+
+int Nxm = 40;  // along track (coarser - laser moves along x)
+int Nym = 20;  // across track (graded, fine at y=0)
+int Nzm = 15;  // through depth (graded, fine at z=0)
+
+real gradY = 2.5;   // y-grading factor
+real gradZ = 2.0;   // z-grading factor (fine near surface z=0)
+
+mesh3 ThCube = cube(Nxm, Nym, Nzm);
+
+// Map: x in [0,Ltrack], y in [-Wdomain,Wdomain] (sinh graded), z in [-Ddomain,0] (exp graded)
+// z_unit=1 -> z_phys=0 (surface), z_unit=0 -> z_phys=-Ddomain (bottom)
+mesh3 Th = movemesh3(ThCube, transfo=[
+    Ltrack * x,
+    Wdomain * sinh(gradY*(2.*y-1.)) / sinh(gradY),
+    -Ddomain * (exp(gradZ*(1.-z))-1.) / (exp(gradZ)-1.)
+]);
+
+cout << "==========================================" << endl;
+cout << " LPBF BEAM SHAPING STUDY" << endl;
+cout << " P=" << Plaser << "W  v=" << vscan*1000. << "mm/s" << endl;
+cout << " Domain: " << Ltrack*1000. << "x" << 2.*Wdomain*1000.
+     << "x" << Ddomain*1000. << "mm" << endl;
+cout << " Mesh: " << Th.nv << " nodes  " << Th.nt << " tets" << endl;
+cout << "==========================================" << endl;
+
+// ============================================================
+// FE SPACE
+// ============================================================
+fespace Sh(Th, P1);
+Sh Temp, Temp0, kEff, CpEff, rhoEff, Tsource, dTemp;
+
+// ============================================================
+// CSV OUTPUT (comparison table like paper Table 1)
+// ============================================================
+{
+    ofstream f(outdir+"beam_comparison.csv");
+    f << "BeamShape,PeakTemp_K,PoolWidth_um,PoolDepth_um,"
+      << "CoolingRate_MKs,LaserSpotSize_um" << endl;
+}
+
+// ============================================================
+// BEAM PROFILE FUNCTIONS
+// r = radial distance from beam axis at current tool position
+// xTool = current x position of beam centre
+// All return surface heat flux [W/m^2]
+// ============================================================
+
+// 1. Gaussian (Eq. 1)
+func real Igauss(real r) {
+    return 2.*Plaser/(pi*Rg^2) * exp(-2.*r^2/Rg^2);
+}
+
+// 2. Elliptical-Gaussian (Eq. 2) -- x,y relative to beam centre
+func real Iellip(real dx, real dy) {
+    return 2.*Plaser/(pi*a1ell*b1ell)
+           * exp(-2.*(dx^2/a1ell^2 + dy^2/b1ell^2));
+}
+
+// 3. Top Hat (Eq. 3) -- uniform inside Rg
+func real Itophat(real r) {
+    if (r <= Rg) return Plaser/(pi*Rg^2);
+    return 0.;
+}
+
+// 4. Flat Top (Eq. 4) -- uniform inside square a2 x a2
+func real Iflatop(real dx, real dy) {
+    if (abs(dx) <= a2ft/2. && abs(dy) <= a2ft/2.)
+        return gammaFT*Plaser/(a2ft^2);
+    return 0.;
+}
+
+// 5. Ring shaped (Eq. 5)
+func real Iring(real r) {
+    real Rm = (Ri+Ro)/2.;
+    return Plaser/(pi*Rm^2) * (r^2/Rm^2) * exp(-r^2/Rm^2);
+}
+
+// 6. AMB (Eq. 6)
+func real Iamb(real r) {
+    real Rm = (Ri+Ro)/2.;
+    return 2.*PgAMB/(pi*Rg^2)*exp(-2.*r^2/Rg^2)
+         + PrAMB/(pi*Rm^2)*(r^2/Rm^2)*exp(-r^2/Rm^2);
+}
+
+// ============================================================
+// TIME STEPPING
+// ============================================================
+// dt: tool advances by dx = v*dt per step
+// Target dx ~ 0.1*Rg for adequate resolution of beam profile
+real dt     = 0.1*Rg / vscan;   // ~10 us
+real ttotal = Ltrack / vscan;    // total scan time
+int  Nstep  = int(ttotal/dt)+1;
+int  Nsave  = Nstep/20;         // 20 output frames per beam
+
+// Beam deposition depth (surface flux distributed over hLayer)
+real dzBeam = hLayer * 2.;      // absorb into 2 layer depths
+
+cout << " dt=" << dt*1e6 << "us  Nstep=" << Nstep << endl;
+
+// ============================================================
+// VARIATIONAL FORM (pure thermal, no flow)
+// Crank-Nicolson for accuracy
+// Boundary conditions:
+//   z=0 (surface, label 2): laser flux + convective cooling
+//   z=-D (bottom, label 1): fixed Tamb (heat sink)
+//   sides y=+-W (labels 3,4): insulated (symmetry/far field)
+//   x=0,x=L (labels 5,6):   insulated (inlet/outlet)
+// ============================================================
+real thetaT = 0.5;
+
+varf aThermal(Temp, dTemp) =
+    int3d(Th)(
+        rhoEff*CpEff/dt * Temp*dTemp
+      + thetaT*kEff*(dx(Temp)*dx(dTemp)+dy(Temp)*dy(dTemp)+dz(Temp)*dz(dTemp))
+    )
+    + int2d(Th,2)( 15.*Temp*dTemp )    // surface: convective h=15 W/m2/K
+    + on(1, Temp=Tamb)                 // bottom: heat sink
+    ;
+
+varf lThermal(Temp, dTemp) =
+    int3d(Th)(
+        rhoEff*CpEff/dt * Temp0*dTemp
+      - (1.-thetaT)*kEff*(
+            dx(Temp0)*dx(dTemp)+dy(Temp0)*dy(dTemp)+dz(Temp0)*dz(dTemp))
+      + Tsource*dTemp
+    )
+    + int2d(Th,2)( 15.*Tamb*dTemp )
+    + on(1, Temp=Tamb)
+    ;
+
+// ============================================================
+// LOOP OVER 6 BEAM SHAPES
+// ============================================================
+string[int] beamNames(6);
+beamNames[0]="Gaussian";
+beamNames[1]="EllipGauss";
+beamNames[2]="TopHat";
+beamNames[3]="FlatTop";
+beamNames[4]="RingShaped";
+beamNames[5]="AMB";
+
+real[int] spotSizes(6);
+spotSizes[0]=Rg*2e6;
+spotSizes[1]=(a1ell+b1ell)*1e6;
+spotSizes[2]=Rg*2e6;
+spotSizes[3]=a2ft*1e6;
+spotSizes[4]=(Ro-Ri)*2e6;
+spotSizes[5]=Rg*2e6;
+
+for (int ibeam=0; ibeam<6; ibeam++) {
+
+    string bname = beamNames[ibeam];
+    cout << endl;
+    cout << "--- BEAM: " << bname << " ---" << endl;
+
+    // Reset temperature field
+    Temp  = Tamb;
+    Temp0 = Tamb;
+
+    // Track diagnostics
+    real TpeakMax   = Tamb;
+    real poolWidth  = 0.;
+    real poolDepth  = 0.;
+    real coolingRate= 0.;
+    real xHalfTrack = Ltrack/2.;
+
+    // Create output directory per beam
+    string bdir = outdir+bname+"\\";
+    system("mkdir \""+bdir+"\"");
+
+    int frame = 0;
+
+    for (int step=0; step<=Nstep; step++) {
+
+        real t    = step*dt;
+        real xTool = vscan * t;    // current beam position
+
+        // Update material properties
+        for (int iv=0; iv<Th.nv; iv++) {
+            real Tv = Temp0[][iv];
+            kEff[][iv]   = kAlSi(Tv);
+            CpEff[][iv]  = CpAlSi(Tv);
+            rhoEff[][iv] = rhoAlSi(Tv);
+        }
+
+        // Compute heat source at current beam position
+        // Source deposited as volumetric flux in top layer (z near 0)
+        {
+            real active = 1.;
+            if (xTool > Ltrack) active = 0.;
+
+            // Each beam shape defines I(x,y) [W/m^2]
+            // Convert to volumetric [W/m^3] by dividing by absorption depth dzBeam
+            // Include z-Gaussian: exp(-(z/dzBeam)^2) to smear into subsurface
+
+            if (ibeam == 0) {
+                // Gaussian
+                Tsource = active / dzBeam
+                    * Igauss(sqrt((x-xTool)^2+y^2))
+                    * exp(-(z/dzBeam)^2);
+            }
+            else if (ibeam == 1) {
+                // Elliptical-Gaussian
+                Tsource = active / dzBeam
+                    * Iellip(x-xTool, y)
+                    * exp(-(z/dzBeam)^2);
+            }
+            else if (ibeam == 2) {
+                // Top Hat
+                Tsource = active / dzBeam
+                    * Itophat(sqrt((x-xTool)^2+y^2))
+                    * exp(-(z/dzBeam)^2);
+            }
+            else if (ibeam == 3) {
+                // Flat Top
+                Tsource = active / dzBeam
+                    * Iflatop(x-xTool, y)
+                    * exp(-(z/dzBeam)^2);
+            }
+            else if (ibeam == 4) {
+                // Ring shaped
+                Tsource = active / dzBeam
+                    * Iring(sqrt((x-xTool)^2+y^2))
+                    * exp(-(z/dzBeam)^2);
+            }
+            else {
+                // AMB
+                Tsource = active / dzBeam
+                    * Iamb(sqrt((x-xTool)^2+y^2))
+                    * exp(-(z/dzBeam)^2);
+            }
+        }
+
+        // Solve thermal
+        matrix MT = aThermal(Sh, Sh);
+        real[int] fT = lThermal(0, Sh);
+        set(MT, solver=UMFPACK);
+        Temp[] = MT^-1 * fT;
+        Temp = max(Temp, Tamb);
+
+        // Track peak temperature
+        real Tp = Temp[].max;
+        if (Tp > TpeakMax) TpeakMax = Tp;
+
+        // At half-track: measure pool geometry + cooling rate
+        if (abs(xTool - xHalfTrack) < vscan*dt*1.5) {
+
+            // Pool width: scan along y at x=xHalfTrack, z=0
+            // Width = 2 * max y where T > Tliq
+            poolWidth = 0.;
+            real dyStep = 2.*Wdomain/Nym;
+            for (int iy=0; iy<=Nym*2; iy++) {
+                real yy = -Wdomain + iy*dyStep;
+                real Tcheck = Temp(xHalfTrack, yy, -1.e-6);
+                if (Tcheck > Tliq) poolWidth = max(poolWidth, 2.*abs(yy));
+            }
+
+            // Pool depth: scan along z at x=xHalfTrack, y=0
+            poolDepth = 0.;
+            real dzStep = Ddomain/Nzm;
+            for (int iz=0; iz<=Nzm; iz++) {
+                real zz = -iz*dzStep;
+                real Tcheck = Temp(xHalfTrack, 1.e-6, zz);
+                if (Tcheck > Tliq) poolDepth = max(poolDepth, abs(zz));
+            }
+
+            // Cooling rate at solidification front:
+            // dT/dt ~ (Tliq - Tsol) / (mushy zone length / vscan)
+            // Mushy zone length along x (behind beam)
+            real mushyLen = 0.;
+            real dxStep = Ltrack/Nxm;
+            for (int ix=0; ix<=Nxm; ix++) {
+                real xx = xHalfTrack - ix*dxStep;
+                if (xx < 0.) break;
+                real Tcheck = Temp(xx, 1.e-6, -1.e-6);
+                if (Tcheck > Tsol && Tcheck < Tliq) mushyLen += dxStep;
+            }
+            if (mushyLen > 1.e-9)
+                coolingRate = (Tliq-Tsol)*vscan / mushyLen;
+
+            cout << "  Half-track: Tp=" << Tp << "K"
+                 << "  W=" << poolWidth*1e6 << "um"
+                 << "  D=" << poolDepth*1e6 << "um"
+                 << "  dTdt=" << coolingRate/1.e6 << "e6 K/s" << endl;
+        }
+
+        // Save VTU frames
+        if (step%Nsave==0 || abs(xTool-xHalfTrack)<vscan*dt*1.5) {
+
+            string num;
+            if      (frame<  10) num="000"+frame;
+            else if (frame< 100) num="00" +frame;
+            else                  num="0"  +frame;
+
+            int[int] ord=[1];
+            savevtk(bdir+"temp_"+num+".vtu", Th,
+                Temp,
+                dataname="Temp_K",
+                order=ord);
+
+            if (frame==0) {
+                ofstream pv(bdir+"beam.pvd");
+                pv<<"<?xml version='1.0'?>"<<endl;
+                pv<<"<VTKFile type='Collection' version='0.1'><Collection>"<<endl;
+            }
+            {
+                ofstream pv(bdir+"beam.pvd",append);
+                pv<<"  <DataSet timestep='"<<t*1e6<<"' file='temp_"
+                  <<num<<".vtu'/>"<<endl;
+            }
+
+            frame++;
+        }
+
+        Temp0 = Temp;
+
+    } // end time loop
+
+    // Close PVD
+    {
+        ofstream pv(bdir+"beam.pvd",append);
+        pv<<"</Collection></VTKFile>"<<endl;
+    }
+
+    // Write to comparison CSV
+    {
+        ofstream cv(outdir+"beam_comparison.csv",append);
+        cv<<bname<<","<<TpeakMax<<","<<poolWidth*1e6<<","
+          <<poolDepth*1e6<<","<<coolingRate/1.e6<<","
+          <<spotSizes[ibeam]<<endl;
+    }
+
+    cout << "  DONE: Tpeak="<<TpeakMax<<"K  W="<<poolWidth*1e6<<"um"
+         << "  D="<<poolDepth*1e6<<"um  dT/dt="<<coolingRate/1.e6<<"e6 K/s"<<endl;
+
+} // end beam loop
+
+// ============================================================
+// PRINT COMPARISON TABLE (like paper Table 1)
+// ============================================================
+cout << endl;
+cout << "==========================================" << endl;
+cout << " RESULTS SUMMARY (compare to paper Table 1)" << endl;
+cout << " BeamShape | Tpeak(K) | Width(um) | Depth(um) | dTdt(e6 K/s)" << endl;
+cout << " Paper ref:  Gaussian=3085K, Ring=1670K" << endl;
+cout << " CSV saved: " << outdir << "beam_comparison.csv" << endl;
+cout << "==========================================" << endl;
+cout << " ParaView: open each beam folder/beam.pvd" << endl;
+cout << " Compare temperature fields side by side" << endl;
+cout << " Threshold T>Tliq=867K -> melt pool shape" << endl;
+cout << "==========================================" << endl;
