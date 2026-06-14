@@ -13,10 +13,9 @@
 <p align="center">
   A fully 3D transient heat transfer simulation of <b>Laser Powder Bed Fusion (LPBF)</b>
   of AlSi10Mg for six different laser beam profiles, implemented in FreeFEM++.
-  Based on <b>Sinha &amp; Mukherjee (2025)</b>, Manufacturing Letters 45, 53-59.
   All six beams run sequentially on the same <b>AMR sinh-graded mesh</b>,
   producing melt pool geometry, peak temperature, and cooling rate for direct
-  comparison against the published Table 1 results.
+  comparison across beam profiles.
 </p>
 
 <img width="1008" height="772" alt="gaussian las" src="https://github.com/user-attachments/assets/3d775956-5c73-432e-aab9-22a85d40df1a" />
@@ -31,11 +30,11 @@ The simulation solves the **3D transient heat equation** at every timestep on a 
 - **Temperature-dependent properties** — `k(T)` and `Cp(T)` for AlSi10Mg with latent heat spike in mushy zone `[Tsol=831K, Tliq=867K]`
 - **Moving laser source** — beam centre advances at `v_scan = 1000 mm/s` along x-axis, deposited as volumetric source over powder layer depth
 - **Enthalpy method** — latent heat absorbed via `Cp_eff = Cp_l + L/(Tliq-Tsol)` in mushy zone
-- **No fluid flow** — pure conduction model, consistent with the Sinha & Mukherjee (2025) approach
+- **No fluid flow** — pure conduction model
 
 ---
 
-## Six Beam Profiles (Equations 1-6 from Paper)
+## Six Beam Profiles
 
 | # | Beam Shape | Formula | Key Parameter |
 |---|---|---|---|
@@ -155,21 +154,6 @@ Cooling rate: dT/dt ~ (Tliq-Tsol) * v_scan / L_mushy
 
 ---
 
-## Expected Results vs Paper Table 1
-
-| Beam Shape | Peak T (K) | Pool Width (um) | Pool Depth (um) | Cooling Rate (x10^6 K/s) |
-|---|---|---|---|---|
-| Gaussian | ~3085 | ~287 | ~119 | ~2.0 |
-| Elliptical-Gaussian | ~2813 | ~372 | ~106 | ~2.2 |
-| Top Hat | ~2429 | ~269 | ~114 | ~2.1 |
-| Flat Top | ~1702 | ~313 | ~95 | ~2.1 |
-| Ring Shaped | ~1670 | ~393 | ~114 | ~1.6 |
-| AMB (80% outer) | ~1655 | ~389 | ~106 | ~1.8 |
-
-*Values from Sinha & Mukherjee (2025), Table 1. FreeFEM++ results approximate these.*
-
----
-
 ## Output Files
 
 ### Per Beam Shape — in `D:\freefem++\lpbf_beams\<BeamName>\`
@@ -262,7 +246,7 @@ Console output example:
   DONE: Tpeak=1658K  W=381um  D=108um
 ...
 ==========================================
- RESULTS SUMMARY (compare to paper Table 1)
+ RESULTS SUMMARY
 ==========================================
 ```
 
@@ -297,7 +281,7 @@ Minimum:    867  (liquidus Tliq)
 Open beam.pvd for all 6 beams simultaneously
 Layout -> 3x2 grid view
 Align all to same timestep (half-track position)
--> Visual comparison matching paper Fig. 3(a-f)
+-> Visual comparison of all beam profiles
 ```
 
 **Option D — Post-process CSV in Python**
@@ -322,7 +306,7 @@ The Gaussian beam concentrates all 400 W into `Rg=100um`, giving peak power dens
 the liquidus, creating a deep narrow melt pool. The large pool volume dissipates
 heat slowly, resulting in a low cooling rate.
 
-### Why the Ring beam reduces peak temperature by ~1400 K
+### Why the Ring beam reduces peak temperature
 The ring distributes energy over a large annular area (`Rm = 162.5 um`). Peak
 intensity is far lower. The resulting pool is wide and shallow — ideal for reducing
 evaporation and keyhole porosity without sacrificing melt pool width.
@@ -337,8 +321,8 @@ yielding a finer grain size.
 ### AMB advantage
 With 80% power in the outer ring, AMB combines the surface preheating of the ring
 (reduces thermal shock) with a small central Gaussian (maintains penetration).
-Results are very similar to the pure ring beam, confirming the paper's finding that
-the outer ring dominates the power distribution.
+Results are very similar to the pure ring beam, confirming that the outer ring
+dominates the power distribution.
 
 ---
 
@@ -349,7 +333,7 @@ the outer ring dominates the power distribution.
 | `Tmax = Tamb` always | `kEff`/`CpEff`/`rhoEff` zero before first matrix assembly | Initialise all property fields to solid values before the time loop |
 | `UMFPACK singular matrix` | Zero coefficients in thermal matrix | Verify `rhoEff`, `CpEff`, `kEff` are nonzero at every node |
 | Melt pool width = 0 | Pool sampling outside liquidus isotherm | Increase `Plaser` or verify `Tliq` value |
-| Tpeak much lower than paper | Absorption depth `dzBeam` too large | Reduce `dzBeam` to `hLayer` (single layer thickness) |
+| Tpeak much lower than expected | Absorption depth `dzBeam` too large | Reduce `dzBeam` to `hLayer` (single layer thickness) |
 | Simulation too slow | 500 steps x 6 beams on large mesh | Reduce `Nxm` to 30; increase dt factor from 0.1 to 0.2 |
 | PVD XML corrupted | Mixed write/append mode | First frame uses plain `ofstream pv(bdir+"beam.pvd")`; all subsequent frames use `append` |
 | Pool depth always 0 | z-sampling below mesh extent | Check `Ddomain` vs `dzStep * Nzm` — ensure scan reaches full depth |
@@ -372,23 +356,6 @@ the outer ring dominates the power distribution.
 ---
 
 ## Citation
-
-If you use this simulation, please cite the underlying paper:
-
-```bibtex
-@article{sinha2025beam,
-  author  = {Sinha, Satyaki and Mukherjee, Tuhin},
-  title   = {Effects of beam shaping on temperature, pool geometry,
-             and cooling rate in laser powder bed fusion},
-  journal = {Manufacturing Letters},
-  volume  = {45},
-  pages   = {53--59},
-  year    = {2025},
-  doi     = {10.1016/j.mfglet.2025.06.210}
-}
-```
-
-And the FreeFEM++ implementation:
 
 ```bibtex
 @software{mishra2026lpbf,
@@ -413,13 +380,6 @@ Plain text citation:
 
 **akshansh11**
 GitHub: https://github.com/akshansh11
-
-FreeFEM++ implementation based on the physics and parameters from:
-
-> Sinha, S. & Mukherjee, T. (2025). *Effects of beam shaping on temperature,
-> pool geometry, and cooling rate in laser powder bed fusion.*
-> Manufacturing Letters, 45, 53-59.
-> https://doi.org/10.1016/j.mfglet.2025.06.210
 
 ---
 
